@@ -324,6 +324,13 @@ main(int argc, char *argv[])
         force_pasv(buf + 12, &data_sock);
         goto after_stdin_block;
       }
+      else if ((memcmp(buf, "RETR", 4) == 0 || memcmp(buf, "LIST", 4) == 0) &&
+               data_sock == -1)
+      {
+        warnx("There is no data connection established with the server");
+        goto after_stdin_block;
+      }
+
 
       if (buf[n] == '\n')
       {
