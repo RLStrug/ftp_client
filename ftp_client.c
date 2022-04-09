@@ -59,7 +59,6 @@ cache_full_flush(cache_s *const cache)
   cache->buf[cache->len] = '\0';
 }
 
-
 int
 cache_line_flush(cache_s *const cache)
 {
@@ -76,58 +75,6 @@ cache_line_flush(cache_s *const cache)
   return 0;
 }
 
-struct SListNode
-{
-  int val;
-  struct SListNode * next;
-};
-
-typedef struct SListNode * list_t;
-
-int
-list_add(list_t *const list, const int val)
-{
-  if (list == NULL)
-  {
-    return -1;
-  }
-  errno = 0;
-  struct SListNode * new_node = malloc(sizeof(struct SListNode));
-  if (new_node == NULL)
-  {
-    warn("Cannot alloacate memory for a new list element");
-    return -2;
-  }
-  new_node->val = val;
-  new_node->next = *list;
-  *list = new_node;
-  return 0;
-}
-
-int
-list_remove(list_t *const list, const list_t elem)
-{
-  if (list == NULL || *list == NULL || elem == NULL)
-  {
-    return -1;
-  }
-  if (*list == elem)
-  {
-    *list = (*list)->next;
-    free(elem);
-    return 0;
-  }
-  for (struct SListNode *node = *list; node->next != NULL; node = node->next)
-  {
-    if (node->next == elem)
-    {
-      node->next = node->next->next;
-      free(elem);
-      return 0;
-    }
-  }
-  return -1;
-}
 
 int
 strtoport(const char *const str, uint16_t *const port)
@@ -206,14 +153,12 @@ connect_to_server(const char *const ip, const uint16_t port)
 #define PASV_RESP_BYTE_SEP ","
 
 int
-search_pasv_resp(cache_s *const cache, list_t *const pasv_sock)
+search_pasv_resp(cache_s *const cache, int *const pasv_sock)
 {
-  // puts("Looking for PASV resp code"); /* DEBUG */
   if (memcmp(cache->buf, PASV_RESP_PREFIX, sizeof(PASV_RESP_PREFIX) - 1) != 0)
   {
     return 1;
   }
-  // printf("Resp found in %s\n", cache->buf); /* DEBUG */
   char *const ip_port_pos = cache->buf + sizeof(PASV_RESP_PREFIX) - 1;
   char *const end_resp = memchr(cache->buf, PASV_RESP_LAST_CHAR, cache->len);
   if (end_resp == NULL)
@@ -245,32 +190,16 @@ search_pasv_resp(cache_s *const cache, list_t *const pasv_sock)
            ip_port[2], ip_port[3]);
   const uint16_t pasv_port = htons(((uint16_t) ip_port[4]) << 8 |
                                    (uint16_t) ip_port[5]);
-  const int sock = connect_to_server(pasv_ip, pasv_port);
-  if (sock < 0)
+  *pasv_sock = connect_to_server(pasv_ip, pasv_port);
+  if (*pasv_sock < 0)
   {
-    return -1;
-  }
-
-  if (list_add(pasv_sock, sock) < 0)
-  {
-    warn("Cannot add passive socket to the list of sockets");
-    errno = 0;
-    if (shutdown(sock, SHUT_RDWR) < 0)
-    {
-      warn("Cannot shutdown the passive connexion");
-    }
-    errno = 0;
-    if (close(sock) < 0)
-    {
-      warn("Cannot close the passive socket");
-    }
     return -1;
   }
   return 0;
 }
 
 int
-force_pasv(char *buf, list_t *const pasv_sock)
+force_pasv(char *buf, int *const pasv_sock)
 {
   const char *const ip = strtok(buf, " ");
   if (ip == NULL)
@@ -283,28 +212,14 @@ force_pasv(char *buf, list_t *const pasv_sock)
   {
     return -1;
   }
-  const int sock = connect_to_server(ip, port);
-  if (sock < 0)
+  *pasv_sock = connect_to_server(ip, port);
+  if (*pasv_sock < 0)
   {
-    return -1;
-  }
-  if (list_add(pasv_sock, sock) < 0)
-  {
-    warn("Cannot add passive socket to the list of sockets");
-    errno = 0;
-    if (shutdown(sock, SHUT_RDWR) < 0)
-    {
-      warn("Cannot shutdown the passive connexion");
-    }
-    errno = 0;
-    if (close(sock) < 0)
-    {
-      warn("Cannot close the passive socket");
-    }
     return -1;
   }
   return 0;
 }
+
 
 int
 main(int argc, char *argv[])
@@ -321,8 +236,8 @@ main(int argc, char *argv[])
     return EXIT_FAILURE;
   }
 
-  const int sock = connect_to_server(argv[1], port);
-  if (sock < 0)
+  const int main_sock = connect_to_server(argv[1], port);
+  if (main_sock < 0)
   {
     return EXIT_FAILURE;
   }
@@ -337,9 +252,10 @@ main(int argc, char *argv[])
   fd_set readfds;
   FD_ZERO(&readfds);
   FD_SET(stdin_fd, &readfds);
-  FD_SET(sock, &readfds);
-  int max_fd = max(stdin_fd, sock);
-  list_t pasv_sock = NULL;
+  FD_SET(main_sock, &readfds);
+  int max_fd = max(stdin_fd, main_sock);
+  int data_sock = -1;
+  FILE *outfile = NULL;
 
   bool expecting_response = false, pasv_requested = false;
   char buf[BUF_SIZE] = {0};
@@ -347,9 +263,9 @@ main(int argc, char *argv[])
   int fd = -1;
   while (errno = 0, fd = select(max_fd + 1, &readfds, NULL, NULL, NULL) >= 0)
   {
-    if (FD_ISSET(sock, &readfds))
+    if (FD_ISSET(main_sock, &readfds))
     {
-      const ssize_t n = recv(sock, buf, BUF_SIZE - 1, 0);
+      const ssize_t n = recv(main_sock, buf, BUF_SIZE - 1, 0);
       buf[n] = '\0';
       fputs(buf, stdout);
 
@@ -366,7 +282,7 @@ main(int argc, char *argv[])
       while (pasv_requested && memchr(cache.buf, '\n', cache.len))
       {
         // puts("Looking for PASV resp code"); /* DEBUG */
-        const int res = search_pasv_resp(&cache, &pasv_sock);
+        const int res = search_pasv_resp(&cache, &data_sock);
         if (res == 0)
         {
           pasv_requested = false;
@@ -391,7 +307,7 @@ main(int argc, char *argv[])
     {
       if (feof(stdin))
       {
-        send(sock, "QUIT\r\n", 6, 0);
+        send(main_sock, "QUIT\r\n", 6, 0);
         goto end;
       }
       if (expecting_response)
@@ -405,7 +321,7 @@ main(int argc, char *argv[])
       if (memcmp(buf, "--force PASV", 12) == 0)
       {
         buf[n] = '\0';
-        force_pasv(buf + 12, &pasv_sock);
+        force_pasv(buf + 12, &data_sock);
         goto after_stdin_block;
       }
 
@@ -418,7 +334,7 @@ main(int argc, char *argv[])
         }
       }
       errno = 0;
-      if (send(sock, buf, n, 0) < 0)
+      if (send(main_sock, buf, n, 0) < 0)
       {
         warn("Cannot send data to server.");
       }
@@ -429,8 +345,33 @@ main(int argc, char *argv[])
 
       if (memcmp(buf, "PASV", 4) == 0)
       {
-        // puts("REQUESTING PASV mode"); /* DEBUG */
         pasv_requested = true;
+      }
+      else if (memcmp(buf, "RETR", 4) == 0)
+      {
+        while (outfile == NULL)
+        {
+          fputs("Write data to file (empty for stdout): ", stdout);
+          fgets(buf, BUF_SIZE, stdin);
+          char *const newline_pos = strchr(buf, '\n');
+          if (newline_pos != NULL)
+          {
+            *newline_pos = '\0';
+          }
+          if (buf[0] == '\0')
+          {
+            outfile = stdout;
+          }
+          else
+          {
+            errno = 0;
+            outfile = fopen(buf, "w");
+            if (outfile == NULL)
+            {
+              warn("Can't open file %s", buf);
+            }
+          }
+        }
       }
       else if (memcmp(buf, "QUIT", 4) == 0)
       {
@@ -439,46 +380,49 @@ main(int argc, char *argv[])
     }
     after_stdin_block:
 
-    for (list_t s = pasv_sock, next = NULL; s != NULL; s = next)
+    if (FD_ISSET(data_sock, &readfds))
     {
-      next = s->next;
-      if (FD_ISSET(s->val, &readfds))
+      const ssize_t n = recv(data_sock, buf, BUF_SIZE - 1, 0);
+      if (n <= 0)
       {
-        const ssize_t n = recv(s->val, buf, BUF_SIZE - 1, 0);
-        if (n <= 0)
+        close(data_sock);
+        data_sock = -1;
+        if (outfile != NULL && outfile != stdout)
         {
-          list_remove(&pasv_sock, s);
-          close(s->val);
+          fclose(outfile);
         }
-        else
-        {
-          buf[n] = '\0';
-          fputs(buf, stdout);
-        }
+        outfile = NULL;
+      }
+      else
+      {
+        buf[n] = '\0';
+        fputs(buf, outfile);
       }
     }
 
-    max_fd = max(stdin_fd, sock);
+    max_fd = max(stdin_fd, main_sock);
     FD_ZERO(&readfds);
     FD_SET(stdin_fd, &readfds);
-    FD_SET(sock, &readfds);
-    for (list_t s = pasv_sock; s != NULL; s = s->next)
+    FD_SET(main_sock, &readfds);
+    if (data_sock != -1)
     {
-      FD_SET(s->val, &readfds);
-      max_fd = max(max_fd, s->val);
+      FD_SET(data_sock, &readfds);
+      max_fd = max(max_fd, data_sock);
     }
   }
   err(EXIT_FAILURE, "An issue happened with the connection");
 
   end:
-  shutdown(sock, SHUT_RDWR);
-  close(sock);
-  for (list_t s = pasv_sock, next = NULL; s != NULL; s = next)
+  shutdown(main_sock, SHUT_RDWR);
+  close(main_sock);
+  if (data_sock != -1)
   {
-    next = s->next;
-    shutdown(s->val, SHUT_RDWR);
-    close(s->val);
-    list_remove(&pasv_sock, s);
+    shutdown(data_sock, SHUT_RDWR);
+    close(data_sock);
+  }
+  if (outfile != NULL && outfile != stdout)
+  {
+    fclose(outfile);
   }
   return EXIT_SUCCESS;
 }
